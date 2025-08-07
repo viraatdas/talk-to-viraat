@@ -1,0 +1,7 @@
+messages/*
+messages_small.*
+.DS_Store
+contacts.txt
+last.txt
+vendor/
+config-db.php
