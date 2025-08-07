@@ -12,6 +12,15 @@ OUTPUT_DIR = "viraat-oss-ft"
 
 # === Load Dataset ===
 dataset = load_dataset("json", data_files=DATASET_PATH)["train"]
+def fix_channel_fields(dataset):
+    for i in range(len(dataset)):
+        dataset[i]["messages"] = [
+            {k: v for k, v in msg.items() if not (msg["role"] in {"developer", "user"} and k == "channel")}
+            for msg in dataset[i]["messages"]
+        ]
+    return dataset
+
+dataset = fix_channel_fields(dataset)
 
 
 # === Load Tokenizer ===
