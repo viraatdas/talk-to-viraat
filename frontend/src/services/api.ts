@@ -10,6 +10,13 @@ export interface ChatResponse {
   thinking?: string
 }
 
+export interface HealthResponse {
+  status: 'ok'
+  timestamp: string
+  model: string | null
+  usingMock: boolean
+}
+
 export class ApiService {
   static async sendMessage(messages: ChatMessage[]): Promise<ChatResponse> {
     try {
@@ -48,6 +55,16 @@ export class ApiService {
       content: randomResponse,
       thinking: "This is just a mock response since the actual model isn't connected yet. The real model will analyze the user's message and respond in Viraat's style."
     }
+  }
+
+  static async getHealth(): Promise<HealthResponse> {
+    const response = await fetch(`${API_BASE_URL}/health`, {
+      method: 'GET',
+    })
+    if (!response.ok) {
+      throw new Error(`Health check failed: ${response.status}`)
+    }
+    return response.json()
   }
 }
 

@@ -1,6 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
+import { fetch } from 'undici'
 
 dotenv.config()
 
@@ -46,16 +47,106 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'Invalid messages format' })
     }
 
-    // TODO: Replace this with actual model inference
-    // For now, return a mock response
-    const response: ChatResponse = await generateMockResponse(messages)
+    const hfToken = process.env.HF_API_TOKEN
+    const hfModelId = process.env.HF_MODEL_ID
+
+    // If HF config is missing, fall back to mock for local dev
+    if (!hfToken || !hfModelId) {
+      const response: ChatResponse = await generateMockResponse(messages)
+      return res.json(response)
+    }
+
+    // Build a simple chat-style prompt
+    const prompt = buildPrompt(messages)
+
+    const responseText = await callHuggingFaceInference(hfModelId, hfToken, prompt)
+
+    const cleaned = postProcessModelOutput(responseText)
+
+    const response: ChatResponse = {
+      content: cleaned,
+    }
 
     res.json(response)
   } catch (error) {
     console.error('Chat error:', error)
-    res.status(500).json({ error: 'Internal server error' })
+    // Fallback to mock on failure to keep UX smooth
+    try {
+      const { messages }: ChatRequest = req.body
+      const response: ChatResponse = await generateMockResponse(messages)
+      return res.json(response)
+    } catch (e) {
+      return res.status(500).json({ error: 'Internal server error' })
+    }
   }
 })
+
+function buildPrompt(messages: ChatMessage[]): string {
+  const systemPreface = `You are Viraat. Respond concisely in short, casual bursts separated by blank lines. If the user greets you, greet back. Keep it friendly.`
+  const lines: string[] = []
+  lines.push(systemPreface)
+  lines.push('')
+  for (const message of messages) {
+    if (message.role === 'user') {
+      lines.push(`User: ${message.content}`)
+    } else {
+      lines.push(`Assistant: ${message.content}`)
+    }
+  }
+  lines.push('Assistant:')
+  return lines.join('\n')
+}
+
+async function callHuggingFaceInference(modelId: string, token: string, prompt: string): Promise<string> {
+  const url = `https://api-inference.huggingface.co/models/${encodeURIComponent(modelId)}`
+  const body = {
+    inputs: prompt,
+    parameters: {
+      max_new_tokens: 256,
+      temperature: 0.7,
+      top_p: 0.95,
+      return_full_text: false,
+    },
+    options: {
+      use_cache: true,
+      wait_for_model: true,
+    },
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    throw new Error(`HF Inference error ${response.status}: ${text}`)
+  }
+
+  const data = await response.json()
+  // Try common shapes
+  if (Array.isArray(data) && data.length > 0) {
+    const first = data[0] as any
+    if (typeof first?.generated_text === 'string') return first.generated_text as string
+    if (typeof first === 'string') return first
+  }
+  if (typeof (data as any)?.generated_text === 'string') return (data as any).generated_text as string
+  if (Array.isArray((data as any)?.choices) && (data as any).choices[0]?.text) return (data as any).choices[0].text
+  return typeof data === 'string' ? data : JSON.stringify(data)
+}
+
+function postProcessModelOutput(output: string): string {
+  // Remove a leading "Assistant:" if the model echoes the role
+  let text = output.trim()
+  if (text.toLowerCase().startsWith('assistant:')) {
+    text = text.slice('assistant:'.length).trim()
+  }
+  return text
+}
 
 async function generateMockResponse(messages: ChatMessage[]): Promise<ChatResponse> {
   // Simulate some processing time
@@ -82,7 +173,9 @@ async function generateMockResponse(messages: ChatMessage[]): Promise<ChatRespon
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+  const hfModelId = process.env.HF_MODEL_ID || null
+  const usingMock = !process.env.HF_API_TOKEN || !process.env.HF_MODEL_ID
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), model: hfModelId, usingMock })
 })
 
 app.listen(PORT, () => {

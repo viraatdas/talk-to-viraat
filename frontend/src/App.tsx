@@ -1,13 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import { Send, Moon, Sun, User, Bot } from 'lucide-react'
 import { clsx } from 'clsx'
-import { ApiService, ChatMessage } from './services/api'
+import { ApiService, ChatMessage, HealthResponse } from './services/api'
 
 interface Message {
   id: string
   content: string
   role: 'user' | 'assistant'
   timestamp: Date
+  thinking?: string
 }
 
 function App() {
@@ -15,7 +16,10 @@ function App() {
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [isDark, setIsDark] = useState(true)
+  const [showThinking, setShowThinking] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [history, setHistory] = useState<string[]>([])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light')
@@ -24,6 +28,10 @@ function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  useEffect(() => {
+    ApiService.getHealth().then(setHealth).catch(() => setHealth(null))
+  }, [])
 
   const sendMessage = async () => {
     if (!input.trim() || isLoading) return
@@ -52,7 +60,8 @@ function App() {
         id: (Date.now() + 1).toString(),
         content: response.content,
         role: 'assistant',
-        timestamp: new Date()
+        timestamp: new Date(),
+        thinking: response.thinking,
       }
       
       setMessages(prev => [...prev, assistantMessage])
@@ -79,26 +88,67 @@ function App() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-background text-foreground">
-      {/* Header */}
-      <header className="flex items-center justify-between p-4 border-b border-border bg-card">
-        <div className="flex items-center space-x-3">
-          <Bot className="w-8 h-8 text-primary" />
-          <div>
-            <h1 className="text-xl font-semibold">Talk to Viraat</h1>
-            <p className="text-sm text-muted-foreground">Fine-tuned on iMessage data</p>
-          </div>
+    <div className="flex h-screen bg-background text-foreground">
+      {/* Sidebar */}
+      <aside className="hidden md:flex md:w-64 border-r border-border bg-card flex-col">
+        <div className="p-4 border-b border-border">
+          <button
+            onClick={() => {
+              if (messages.length > 0) setHistory(prev => [new Date().toLocaleString(), ...prev])
+              setMessages([])
+            }}
+            className="w-full py-2 px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+          >
+            New chat
+          </button>
         </div>
-        <button
-          onClick={() => setIsDark(!isDark)}
-          className="p-2 rounded-lg hover:bg-secondary transition-colors"
-        >
-          {isDark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
-        </button>
-      </header>
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          <div className="px-3 py-2 text-xs uppercase text-muted-foreground">History</div>
+          {history.length === 0 ? (
+            <div className="px-3 py-2 text-sm text-muted-foreground">No chats yet</div>
+          ) : (
+            history.map((h, i) => (
+              <div key={i} className="px-3 py-2 text-sm rounded hover:bg-secondary cursor-default">
+                {h}
+              </div>
+            ))
+          )}
+        </div>
+      </aside>
 
-      {/* Chat Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      {/* Main column */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Header */}
+        <header className="flex items-center justify-between p-4 border-b border-border bg-card">
+          <div className="flex items-center space-x-3">
+            <Bot className="w-8 h-8 text-primary" />
+            <div>
+              <h1 className="text-xl font-semibold">Talk to Viraat</h1>
+              <p className="text-sm text-muted-foreground">
+                {health?.model ? `Model: ${health.model}` : 'Mock mode'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="text-sm text-muted-foreground flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={showThinking}
+                onChange={(e) => setShowThinking(e.target.checked)}
+              />
+              Show thinking
+            </label>
+            <button
+              onClick={() => setIsDark(!isDark)}
+              className="p-2 rounded-lg hover:bg-secondary transition-colors"
+            >
+              {isDark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+            </button>
+          </div>
+        </header>
+
+        {/* Chat Messages */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center space-y-4">
             <Bot className="w-16 h-16 text-muted-foreground" />
@@ -128,7 +178,7 @@ function App() {
             )}>
               {message.role === 'user' ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
             </div>
-            <div className={clsx(
+               <div className={clsx(
               'flex-1 max-w-2xl',
               message.role === 'user' ? 'text-right' : ''
             )}>
@@ -140,6 +190,11 @@ function App() {
               )}>
                 <div className="whitespace-pre-wrap">{message.content}</div>
               </div>
+                 {showThinking && message.thinking && message.role === 'assistant' && (
+                  <div className="mt-2 text-xs text-muted-foreground bg-secondary/40 rounded p-2 border border-border">
+                    <div className="font-mono whitespace-pre-wrap">{message.thinking}</div>
+                  </div>
+                 )}
               <div className="text-xs text-muted-foreground mt-1">
                 {message.timestamp.toLocaleTimeString()}
               </div>
@@ -167,26 +222,27 @@ function App() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input Area */}
-      <div className="border-t border-border bg-card p-4">
-        <div className="max-w-4xl mx-auto flex space-x-4">
-          <div className="flex-1 relative">
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyPress}
-              placeholder="Message Viraat..."
-              className="w-full p-3 pr-12 rounded-lg border border-border bg-background resize-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
-              rows={1}
-              style={{ minHeight: '44px', maxHeight: '120px' }}
-            />
-            <button
-              onClick={sendMessage}
-              disabled={!input.trim() || isLoading}
-              className="absolute right-2 top-1/2 transform -translate-y-1/2 p-2 rounded-md bg-primary text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90 transition-colors"
-            >
-              <Send className="w-4 h-4" />
-            </button>
+        {/* Input Area */}
+        <div className="border-t border-border bg-card p-4">
+          <div className="max-w-4xl mx-auto flex space-x-4">
+            <div className="flex-1 relative">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyPress}
+                placeholder="Message Viraat..."
+                className="w-full p-3 pr-12 rounded-lg border border-border bg-background resize-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                rows={1}
+                style={{ minHeight: '44px', maxHeight: '120px' }}
+              />
+              <button
+                onClick={sendMessage}
+                disabled={!input.trim() || isLoading}
+                className="absolute right-2 top-1/2 transform -translate-y-1/2 p-2 rounded-md bg-primary text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90 transition-colors"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
