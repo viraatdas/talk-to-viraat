@@ -116,15 +116,11 @@ def extract_json_from_response(response_text: str) -> Optional[Dict[str, Any]]:
             return None
         raw = candidates[-1].strip()
 
-        # Normalize common mistakes
-        raw = re.sub(r"\{\s*humanlike\s*:\s*", '{"humanlike": ', raw)
-        raw = re.sub(r"\,\s*explanation\s*:\s*", ', "explanation": ', raw)
-        raw = re.sub(
-            r'(\"humanlike\"\s*:\s*)(yes|no)([\s,}])',
-            r'\1"\2"\3',
-            raw,
-            flags=re.IGNORECASE,
-        )
+        # Normalize bad quotes and formatting issues
+        raw = raw.replace("“", '"').replace("”", '"')
+        raw = raw.replace("‘", "'").replace("’", "'")
+        raw = re.sub(r"(\{|,)\s*(\w+)\s*:", r'\1 "\2":', raw)  # fix unquoted keys
+        raw = re.sub(r":\s*(yes|no)([,\s}])", r': "\1"\2', raw, flags=re.IGNORECASE)  # quote yes/no
 
         parsed = json.loads(raw)
         humanlike_val = str(parsed.get("humanlike", "")).strip().lower()
@@ -134,7 +130,7 @@ def extract_json_from_response(response_text: str) -> Optional[Dict[str, Any]]:
         if not isinstance(explanation_val, str):
             explanation_val = str(explanation_val)
         return {"humanlike": humanlike_val, "explanation": explanation_val}
-    except Exception:
+    except Exception as e:
         return None
 
 
