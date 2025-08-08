@@ -1,3 +1,42 @@
+# Ignore model checkpoints and outputs
+inference/*/adapter_model.safetensors
+inference/*/adapter_config.json
+inference/*/training_args.bin
+inference/*/optimizer.pt
+inference/*/scheduler.pt
+inference/*/rng_state.pth
+inference/*/trainer_state.json
+inference/*/tokenizer.json
+inference/*/tokenizer_config.json
+inference/*/special_tokens_map.json
+inference/*/chat_template.jinja
+inference/*/README.md
+
+# Ignore nested checkpoint directories
+inference/**/checkpoint-*/
+
+# Keep scripts
+!inference/chat_inference.py
+
+# Ignore dataset artifacts
+*.jsonl
+*.parquet
+*.csv
+
+# Ignore compiled and temporary files
+__pycache__/
+*.py[cod]
+*.so
+
+# Ignore venvs and local environments
+.venv/
+env/
+venv/
+
+# Ignore system files
+.DS_Store
+
+
 # Large data files
 finetune/viraat_finetune.jsonl
 iMessage-Export/chat.db
