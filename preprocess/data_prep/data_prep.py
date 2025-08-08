@@ -114,24 +114,31 @@ def extract_json_from_response(response_text: str) -> Optional[Dict[str, Any]]:
         candidates = _find_balanced_json_objects(response_text)
         if not candidates:
             return None
-        raw = candidates[-1].strip()
 
-        # Normalize bad quotes and formatting issues
-        raw = raw.replace("“", '"').replace("”", '"')
-        raw = raw.replace("‘", "'").replace("’", "'")
-        raw = re.sub(r"(\{|,)\s*(\w+)\s*:", r'\1 "\2":', raw)  # fix unquoted keys
-        raw = re.sub(r":\s*(yes|no)([,\s}])", r': "\1"\2', raw, flags=re.IGNORECASE)  # quote yes/no
+        for raw in reversed(candidates):  # Try last JSON-like block first
+            try:
+                cleaned = raw.strip()
 
-        parsed = json.loads(raw)
-        humanlike_val = str(parsed.get("humanlike", "")).strip().lower()
-        if humanlike_val not in {"yes", "no"}:
-            return None
-        explanation_val = parsed.get("explanation", "")
-        if not isinstance(explanation_val, str):
-            explanation_val = str(explanation_val)
-        return {"humanlike": humanlike_val, "explanation": explanation_val}
-    except Exception as e:
+                # Normalize common errors
+                cleaned = cleaned.replace("“", '"').replace("”", '"')
+                cleaned = cleaned.replace("‘", "'").replace("’", "'")
+                cleaned = re.sub(r"(\{|,)\s*(\w+)\s*:", r'\1 "\2":', cleaned)
+                cleaned = re.sub(r":\s*(yes|no)([,\s}])", r': "\1"\2', cleaned, flags=re.IGNORECASE)
+
+                parsed = json.loads(cleaned)
+                humanlike_val = str(parsed.get("humanlike", "")).strip().lower()
+                if humanlike_val not in {"yes", "no"}:
+                    continue
+                explanation_val = parsed.get("explanation", "")
+                if not isinstance(explanation_val, str):
+                    explanation_val = str(explanation_val)
+                return {"humanlike": humanlike_val, "explanation": explanation_val}
+            except json.JSONDecodeError:
+                continue
         return None
+    except Exception:
+        return None
+
 
 
 def build_prompt(user: str, assistant: str, *, retry: bool = False) -> str:
