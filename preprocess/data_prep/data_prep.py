@@ -29,6 +29,15 @@ model.eval()
 if getattr(model.config, "pad_token_id", None) is None:
     model.config.pad_token_id = tokenizer.pad_token_id
 
+# === Stats ===
+STATS: Dict[str, int] = {
+    "pairs_total": 0,
+    "pairs_kept": 0,
+    "pairs_rejected": 0,
+    "parse_failures": 0,
+    "retry_success": 0,
+}
+
 # === Load messages from CSV ===
 
 def parse_timestamp(value: str) -> datetime:
@@ -125,23 +134,51 @@ def extract_json_from_response(response_text: str) -> Optional[Dict[str, Any]]:
         if not isinstance(explanation_val, str):
             explanation_val = str(explanation_val)
         return {"humanlike": humanlike_val, "explanation": explanation_val}
-    except Exception as e:
-        print(f"⚠️ JSON parsing error: {e}")
+    except Exception:
         return None
 
 
-def llm_filter(user: str, assistant: str) -> bool:
-    prompt = (
-        "Below is a short exchange between two people: one is the user, the other is the assistant. "
-        "Both messages are informal, text-style, and may include emojis, slang, or typos. "
-        "Determine if this feels like a natural, realistic exchange you'd find in an actual human text conversation. "
-        "Do NOT penalize for grammar, punctuation, or style — only reject if the exchange is confusing, incoherent, or unnatural.\n\n"
-        "Respond ONLY with a JSON object using *double quotes*, no explanation outside the object:\n"
-        '{"humanlike": "yes" or "no", "explanation": "brief reason here"}\n\n'
-        f"User: {user.strip()}\n"
-        f"Assistant: {assistant.strip()}"
+def build_prompt(user: str, assistant: str, *, retry: bool = False) -> str:
+    constraints = (
+        "You are a strict classifier. Output exactly ONE JSON object and nothing else.\n"
+        "Rules:\n"
+        "- Use double quotes for all keys and string values.\n"
+        "- Keys: humanlike, explanation.\n"
+        "- humanlike must be \"yes\" or \"no\".\n"
+        "- explanation: max 12 words.\n"
+        "- No code fences, no commentary, no extra text before/after the JSON.\n"
+        "- No trailing commas.\n\n"
+        "Schema:\n{\"humanlike\": \"yes\" or \"no\", \"explanation\": \"brief reason\"}\n\n"
     )
 
+    if retry:
+        return (
+            constraints
+            + f"User: {user.strip()}\n"
+            + f"Assistant: {assistant.strip()}\n\n"
+            + "ONLY return the JSON object."
+        )
+
+    few_shots = (
+        "Examples:\n"
+        "User: Ohh I am fine with it, I just wanted to know. Thanks\n"
+        "Assistant: No wait! ...?\n"
+        "Output:\n{\"humanlike\": \"no\", \"explanation\": \"assistant reply is abrupt and unclear\"}\n\n"
+        "User: Wait what?\n"
+        "Assistant: Got an iPhone 6S. I kinda get it why you like it now 😲\n"
+        "Output:\n{\"humanlike\": \"no\", \"explanation\": \"assistant reply ignores user context\"}\n\n"
+    )
+
+    task = (
+        f"User: {user.strip()}\n"
+        f"Assistant: {assistant.strip()}\n\n"
+        "Output only the JSON object:"
+    )
+
+    return constraints + few_shots + task
+
+
+def _generate_json_decision(prompt: str) -> Optional[Dict[str, Any]]:
     inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
     input_len = inputs.input_ids.shape[1]
     with torch.no_grad():
@@ -153,15 +190,21 @@ def llm_filter(user: str, assistant: str) -> bool:
             max_new_tokens=96,
             do_sample=False,
         )
-
-    # Only decode the generated continuation, not the prompt
     completion_tokens = output[0, input_len:]
     completion_text = tokenizer.decode(completion_tokens, skip_special_tokens=True).strip()
+    return extract_json_from_response(completion_text)
 
-    parsed = extract_json_from_response(completion_text)
-    if not parsed:
-        print("⚠️ LLM response parsing failed:")
-        print(completion_text)
+
+def llm_filter(user: str, assistant: str) -> bool:
+    # First attempt with few-shot prompt
+    parsed = _generate_json_decision(build_prompt(user, assistant, retry=False))
+    if parsed is None:
+        STATS["parse_failures"] += 1
+        # Retry with stricter prompt
+        parsed = _generate_json_decision(build_prompt(user, assistant, retry=True))
+        if parsed is not None:
+            STATS["retry_success"] += 1
+    if parsed is None:
         # Persist failure context for debugging
         try:
             with open("llm_filter_failures.log", "a", encoding="utf-8") as lf:
@@ -170,7 +213,6 @@ def llm_filter(user: str, assistant: str) -> bool:
                         {
                             "user": user,
                             "assistant": assistant,
-                            "completion": completion_text,
                         }
                     )
                     + "\n"
@@ -210,10 +252,12 @@ def build_pairs(raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         prev_turn = turns[i - 1]
         curr_turn = turns[i]
         if prev_turn["role"] == "user" and curr_turn["role"] == "assistant":
+            STATS["pairs_total"] += 1
             user_msg = prev_turn["text"].strip()
             assistant_msg = curr_turn["text"].strip()
 
             if llm_filter(user_msg, assistant_msg):
+                STATS["pairs_kept"] += 1
                 dataset.append(
                     {
                         "messages": [
@@ -226,6 +270,8 @@ def build_pairs(raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         ]
                     }
                 )
+            else:
+                STATS["pairs_rejected"] += 1
     return dataset
 
 
@@ -237,4 +283,10 @@ print(f"💾 Saving {len(filtered_dataset)} examples to {OUTPUT_PATH}")
 with open(OUTPUT_PATH, "w", encoding="utf-8") as out_file:
     for item in filtered_dataset:
         out_file.write(json.dumps(item) + "\n")
+
+print(
+    "Summary -> "
+    f"total_pairs={STATS['pairs_total']}, kept={STATS['pairs_kept']}, rejected={STATS['pairs_rejected']}, "
+    f"parse_failures={STATS['parse_failures']}, retry_success={STATS['retry_success']}"
+)
 
