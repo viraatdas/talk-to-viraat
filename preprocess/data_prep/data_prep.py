@@ -8,12 +8,21 @@ from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
+# Enable faster matmul on Hopper (H100)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
 # === Config ===
 CSV_PATH = "messages.csv"
 OUTPUT_PATH = "filtered_finetune.jsonl"
 MODEL_NAME = "openai/gpt-oss-20b"
-BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "8"))  # heuristic for H100 + 20B
-MAX_NEW_TOKENS = 96
+BATCH_SIZE_DEFAULT = int(os.getenv("LLM_BATCH_SIZE", "32"))  # good starting point for H100
+BATCH_SIZE_MAX = int(os.getenv("LLM_BATCH_SIZE_MAX", "64"))
+MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "32"))  # JSON is tiny
 
 # === Load tokenizer and model ===
 (tokenizer := AutoTokenizer.from_pretrained(MODEL_NAME))
@@ -22,12 +31,21 @@ if tokenizer.pad_token is None:
 # Left padding is more stable for decoder-only models when batching
 tokenizer.padding_side = "left"
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    attn_implementation="eager",
-)
+# Try flash attention v2, fall back to eager if unavailable
+try:
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="flash_attention_2",
+    )
+except Exception:
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="eager",
+    )
 model.eval()
 if getattr(model.config, "pad_token_id", None) is None:
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -154,7 +172,8 @@ def build_prompt(user: str, assistant: str, *, retry: bool = False) -> str:
         "Schema:\n{\"humanlike\": \"yes\" or \"no\", \"explanation\": \"brief reason\"}\n\n"
     )
 
-    if retry:
+    # First pass: minimal prompt (no few-shots)
+    if not retry:
         return (
             constraints
             + f"User: {user.strip()}\n"
@@ -162,6 +181,7 @@ def build_prompt(user: str, assistant: str, *, retry: bool = False) -> str:
             + "ONLY return the JSON object."
         )
 
+    # Retry: include few-shots for stronger coercion
     few_shots = (
         "Examples:\n"
         "User: Ohh I am fine with it, I just wanted to know. Thanks\n"
@@ -172,89 +192,91 @@ def build_prompt(user: str, assistant: str, *, retry: bool = False) -> str:
         "Output:\n{\"humanlike\": \"no\", \"explanation\": \"assistant reply ignores user context\"}\n\n"
     )
 
-    task = (
-        f"User: {user.strip()}\n"
-        f"Assistant: {assistant.strip()}\n\n"
-        "Output only the JSON object:"
+    return (
+        constraints
+        + few_shots
+        + f"User: {user.strip()}\n"
+        + f"Assistant: {assistant.strip()}\n\n"
+        + "ONLY return the JSON object."
     )
 
-    return constraints + few_shots + task
 
-
-def _generate_batch(prompts: List[str]) -> List[Optional[Dict[str, Any]]]:
-    if not prompts:
-        return []
-    try_batch = len(prompts)
-    # We may need to split into chunks if prompts > BATCH_SIZE
+def _generate_once(prompts: List[str]) -> List[Optional[Dict[str, Any]]]:
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=False).to(model.device)
+    input_lens = inputs.attention_mask.sum(dim=1)
+    with torch.inference_mode():
+        output = model.generate(
+            inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+        )
     results: List[Optional[Dict[str, Any]]] = []
-    for start in range(0, len(prompts), BATCH_SIZE):
-        end = min(start + BATCH_SIZE, len(prompts))
-        sub_prompts = prompts[start:end]
-        # Tokenize
-        inputs = tokenizer(sub_prompts, return_tensors="pt", padding=True, truncation=False).to(model.device)
-        input_lens = inputs.attention_mask.sum(dim=1)
-        # Generate
-        with torch.inference_mode():
-            try:
-                output = model.generate(
-                    inputs.input_ids,
-                    attention_mask=inputs.attention_mask,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    do_sample=False,
-                )
-            except torch.cuda.OutOfMemoryError:
-                # Fallback: run each in single-item batches to make progress
-                torch.cuda.empty_cache()
-                for i in range(len(sub_prompts)):
-                    mini_inputs = {k: v[i:i+1] for k, v in inputs.items()}
-                    mini_len = int(input_lens[i].item())
-                    out = model.generate(
-                        mini_inputs["input_ids"],
-                        attention_mask=mini_inputs["attention_mask"],
-                        pad_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                        max_new_tokens=MAX_NEW_TOKENS,
-                        do_sample=False,
-                    )
-                    tokens = out[0, mini_len:]
-                    text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-                    results.append(extract_json_from_response(text))
-                continue
-        # Decode per sample
-        for i in range(end - start):
-            in_len = int(input_lens[i].item())
-            tokens = output[i, in_len:]
-            text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-            results.append(extract_json_from_response(text))
+    for i in range(output.shape[0]):
+        in_len = int(input_lens[i].item())
+        tokens = output[i, in_len:]
+        text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+        results.append(extract_json_from_response(text))
     return results
 
 
-def llm_filter_batch(users: List[str], assistants: List[str]) -> List[bool]:
-    # First pass
+def _generate_batch_robust(prompts: List[str], max_bs: int) -> List[Optional[Dict[str, Any]]]:
+    # Process in chunks up to max_bs, with recursive OOM backoff
+    results: List[Optional[Dict[str, Any]]] = []
+    for start in range(0, len(prompts), max_bs):
+        sub = prompts[start : start + max_bs]
+        # Try whole sub-batch; on OOM, split recursively
+        try:
+            results.extend(_generate_once(sub))
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if len(sub) == 1:
+                # Last resort: try single item after cache clear, else fail
+                try:
+                    results.extend(_generate_once(sub))
+                except Exception:
+                    results.append(None)
+                continue
+            mid = len(sub) // 2
+            left = _generate_batch_robust(sub[:mid], max_bs=max(1, max_bs // 2))
+            right = _generate_batch_robust(sub[mid:], max_bs=max(1, max_bs // 2))
+            results.extend(left + right)
+        except Exception:
+            # Non-OOM failure; degrade to per-item processing for this chunk
+            for p in sub:
+                try:
+                    results.extend(_generate_once([p]))
+                except Exception:
+                    results.append(None)
+    return results
+
+
+def llm_filter_batch(users: List[str], assistants: List[str], max_bs: int) -> List[bool]:
+    # First pass (minimal prompt)
     prompts = [build_prompt(u, a, retry=False) for u, a in zip(users, assistants)]
-    parsed = _generate_batch(prompts)
+    parsed = _generate_batch_robust(prompts, max_bs=max_bs)
     decisions: List[Optional[bool]] = [None if p is None else p["humanlike"].lower() == "yes" for p in parsed]
-    # Retry only failed parses
+
+    # Retry only failed parses with few-shots
     failed_indices = [i for i, d in enumerate(decisions) if d is None]
     if failed_indices:
         STATS["parse_failures"] += len(failed_indices)
         retry_prompts = [build_prompt(users[i], assistants[i], retry=True) for i in failed_indices]
-        retry_parsed = _generate_batch(retry_prompts)
+        retry_parsed = _generate_batch_robust(retry_prompts, max_bs=max_bs)
         for idx, rp in zip(failed_indices, retry_parsed):
             if rp is not None:
                 STATS["retry_success"] += 1
                 decisions[idx] = rp["humanlike"].lower() == "yes"
             else:
                 decisions[idx] = False
-                # Log failure context
                 try:
                     with open("llm_filter_failures.log", "a", encoding="utf-8") as lf:
                         lf.write(json.dumps({"user": users[idx], "assistant": assistants[idx]}) + "\n")
                 except Exception:
                     pass
-    # Convert Optional[bool] to bool (safe now)
+
     return [bool(d) for d in decisions]
 
 
@@ -292,13 +314,16 @@ def build_pairs(raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     STATS["pairs_total"] = len(pairs)
     dataset: List[Dict[str, Any]] = []
 
-    # Batched filtering
+    # Adaptive max batch size ramp-up
+    current_max_bs = max(1, BATCH_SIZE_DEFAULT)
+
     with tqdm(total=len(pairs), desc="Filtering", unit="pair") as pbar:
-        for start in range(0, len(pairs), BATCH_SIZE):
-            end = min(start + BATCH_SIZE, len(pairs))
-            batch_users = [pairs[i][0] for i in range(start, end)]
-            batch_assistants = [pairs[i][1] for i in range(start, end)]
-            keep_mask = llm_filter_batch(batch_users, batch_assistants)
+        idx = 0
+        while idx < len(pairs):
+            end = min(idx + current_max_bs, len(pairs))
+            batch_users = [pairs[i][0] for i in range(idx, end)]
+            batch_assistants = [pairs[i][1] for i in range(idx, end)]
+            keep_mask = llm_filter_batch(batch_users, batch_assistants, max_bs=current_max_bs)
             for u, a, keep in zip(batch_users, batch_assistants, keep_mask):
                 if keep:
                     STATS["pairs_kept"] += 1
@@ -316,7 +341,13 @@ def build_pairs(raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     )
                 else:
                     STATS["pairs_rejected"] += 1
-            pbar.update(end - start)
+            processed = end - idx
+            idx = end
+            pbar.update(processed)
+
+            # Ramp up gradually up to max
+            if current_max_bs < BATCH_SIZE_MAX:
+                current_max_bs = min(BATCH_SIZE_MAX, current_max_bs + 8)
     return dataset
 
 
