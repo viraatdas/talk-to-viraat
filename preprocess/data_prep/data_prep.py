@@ -1,7 +1,8 @@
 import csv
 import json
 import re
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -11,6 +12,8 @@ import torch
 CSV_PATH = "messages.csv"
 OUTPUT_PATH = "filtered_finetune.jsonl"
 MODEL_NAME = "openai/gpt-oss-20b"
+BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "8"))  # heuristic for H100 + 20B
+MAX_NEW_TOKENS = 96
 
 # === Load tokenizer and model ===
 (tokenizer := AutoTokenizer.from_pretrained(MODEL_NAME))
@@ -114,31 +117,28 @@ def extract_json_from_response(response_text: str) -> Optional[Dict[str, Any]]:
         candidates = _find_balanced_json_objects(response_text)
         if not candidates:
             return None
+        raw = candidates[-1].strip()
 
-        for raw in reversed(candidates):  # Try last JSON-like block first
-            try:
-                cleaned = raw.strip()
+        # Normalize common mistakes
+        raw = re.sub(r"\{\s*humanlike\s*:\s*", '{"humanlike": ', raw)
+        raw = re.sub(r"\,\s*explanation\s*:\s*", ', "explanation": ', raw)
+        raw = re.sub(
+            r'(\"humanlike\"\s*:\s*)(yes|no)([\s,}])',
+            r'\1"\2"\3',
+            raw,
+            flags=re.IGNORECASE,
+        )
 
-                # Normalize common errors
-                cleaned = cleaned.replace("“", '"').replace("”", '"')
-                cleaned = cleaned.replace("‘", "'").replace("’", "'")
-                cleaned = re.sub(r"(\{|,)\s*(\w+)\s*:", r'\1 "\2":', cleaned)
-                cleaned = re.sub(r":\s*(yes|no)([,\s}])", r': "\1"\2', cleaned, flags=re.IGNORECASE)
-
-                parsed = json.loads(cleaned)
-                humanlike_val = str(parsed.get("humanlike", "")).strip().lower()
-                if humanlike_val not in {"yes", "no"}:
-                    continue
-                explanation_val = parsed.get("explanation", "")
-                if not isinstance(explanation_val, str):
-                    explanation_val = str(explanation_val)
-                return {"humanlike": humanlike_val, "explanation": explanation_val}
-            except json.JSONDecodeError:
-                continue
-        return None
+        parsed = json.loads(raw)
+        humanlike_val = str(parsed.get("humanlike", "")).strip().lower()
+        if humanlike_val not in {"yes", "no"}:
+            return None
+        explanation_val = parsed.get("explanation", "")
+        if not isinstance(explanation_val, str):
+            explanation_val = str(explanation_val)
+        return {"humanlike": humanlike_val, "explanation": explanation_val}
     except Exception:
         return None
-
 
 
 def build_prompt(user: str, assistant: str, *, retry: bool = False) -> str:
@@ -181,50 +181,81 @@ def build_prompt(user: str, assistant: str, *, retry: bool = False) -> str:
     return constraints + few_shots + task
 
 
-def _generate_json_decision(prompt: str) -> Optional[Dict[str, Any]]:
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
-    input_len = inputs.input_ids.shape[1]
-    with torch.no_grad():
-        output = model.generate(
-            inputs.input_ids,
-            attention_mask=inputs.attention_mask,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            max_new_tokens=96,
-            do_sample=False,
-        )
-    completion_tokens = output[0, input_len:]
-    completion_text = tokenizer.decode(completion_tokens, skip_special_tokens=True).strip()
-    return extract_json_from_response(completion_text)
-
-
-def llm_filter(user: str, assistant: str) -> bool:
-    # First attempt with few-shot prompt
-    parsed = _generate_json_decision(build_prompt(user, assistant, retry=False))
-    if parsed is None:
-        STATS["parse_failures"] += 1
-        # Retry with stricter prompt
-        parsed = _generate_json_decision(build_prompt(user, assistant, retry=True))
-        if parsed is not None:
-            STATS["retry_success"] += 1
-    if parsed is None:
-        # Persist failure context for debugging
-        try:
-            with open("llm_filter_failures.log", "a", encoding="utf-8") as lf:
-                lf.write(
-                    json.dumps(
-                        {
-                            "user": user,
-                            "assistant": assistant,
-                        }
-                    )
-                    + "\n"
+def _generate_batch(prompts: List[str]) -> List[Optional[Dict[str, Any]]]:
+    if not prompts:
+        return []
+    try_batch = len(prompts)
+    # We may need to split into chunks if prompts > BATCH_SIZE
+    results: List[Optional[Dict[str, Any]]] = []
+    for start in range(0, len(prompts), BATCH_SIZE):
+        end = min(start + BATCH_SIZE, len(prompts))
+        sub_prompts = prompts[start:end]
+        # Tokenize
+        inputs = tokenizer(sub_prompts, return_tensors="pt", padding=True, truncation=False).to(model.device)
+        input_lens = inputs.attention_mask.sum(dim=1)
+        # Generate
+        with torch.inference_mode():
+            try:
+                output = model.generate(
+                    inputs.input_ids,
+                    attention_mask=inputs.attention_mask,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=False,
                 )
-        except Exception:
-            pass
-        return False
+            except torch.cuda.OutOfMemoryError:
+                # Fallback: run each in single-item batches to make progress
+                torch.cuda.empty_cache()
+                for i in range(len(sub_prompts)):
+                    mini_inputs = {k: v[i:i+1] for k, v in inputs.items()}
+                    mini_len = int(input_lens[i].item())
+                    out = model.generate(
+                        mini_inputs["input_ids"],
+                        attention_mask=mini_inputs["attention_mask"],
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        max_new_tokens=MAX_NEW_TOKENS,
+                        do_sample=False,
+                    )
+                    tokens = out[0, mini_len:]
+                    text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+                    results.append(extract_json_from_response(text))
+                continue
+        # Decode per sample
+        for i in range(end - start):
+            in_len = int(input_lens[i].item())
+            tokens = output[i, in_len:]
+            text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            results.append(extract_json_from_response(text))
+    return results
 
-    return parsed["humanlike"].lower() == "yes"
+
+def llm_filter_batch(users: List[str], assistants: List[str]) -> List[bool]:
+    # First pass
+    prompts = [build_prompt(u, a, retry=False) for u, a in zip(users, assistants)]
+    parsed = _generate_batch(prompts)
+    decisions: List[Optional[bool]] = [None if p is None else p["humanlike"].lower() == "yes" for p in parsed]
+    # Retry only failed parses
+    failed_indices = [i for i, d in enumerate(decisions) if d is None]
+    if failed_indices:
+        STATS["parse_failures"] += len(failed_indices)
+        retry_prompts = [build_prompt(users[i], assistants[i], retry=True) for i in failed_indices]
+        retry_parsed = _generate_batch(retry_prompts)
+        for idx, rp in zip(failed_indices, retry_parsed):
+            if rp is not None:
+                STATS["retry_success"] += 1
+                decisions[idx] = rp["humanlike"].lower() == "yes"
+            else:
+                decisions[idx] = False
+                # Log failure context
+                try:
+                    with open("llm_filter_failures.log", "a", encoding="utf-8") as lf:
+                        lf.write(json.dumps({"user": users[idx], "assistant": assistants[idx]}) + "\n")
+                except Exception:
+                    pass
+    # Convert Optional[bool] to bool (safe now)
+    return [bool(d) for d in decisions]
 
 
 def _merge_consecutive_turns(raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -250,31 +281,42 @@ def _merge_consecutive_turns(raw_messages: List[Dict[str, Any]]) -> List[Dict[st
 
 def build_pairs(raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     turns = _merge_consecutive_turns(raw_messages)
-    dataset: List[Dict[str, Any]] = []
-    for i in tqdm(range(1, len(turns)), desc="Filtering", unit="pair"):
+    # Build candidate pairs list
+    pairs: List[Tuple[str, str]] = []
+    for i in range(1, len(turns)):
         prev_turn = turns[i - 1]
         curr_turn = turns[i]
         if prev_turn["role"] == "user" and curr_turn["role"] == "assistant":
-            STATS["pairs_total"] += 1
-            user_msg = prev_turn["text"].strip()
-            assistant_msg = curr_turn["text"].strip()
+            pairs.append((prev_turn["text"].strip(), curr_turn["text"].strip()))
 
-            if llm_filter(user_msg, assistant_msg):
-                STATS["pairs_kept"] += 1
-                dataset.append(
-                    {
-                        "messages": [
-                            {
-                                "role": "developer",
-                                "content": "You are Viraat. Speak like Viraat: dry, witty, text-like bursts. Respond casually, smartly, often using newlines to separate thoughts.",
-                            },
-                            {"role": "user", "content": user_msg},
-                            {"role": "assistant", "channel": "final", "content": assistant_msg},
-                        ]
-                    }
-                )
-            else:
-                STATS["pairs_rejected"] += 1
+    STATS["pairs_total"] = len(pairs)
+    dataset: List[Dict[str, Any]] = []
+
+    # Batched filtering
+    with tqdm(total=len(pairs), desc="Filtering", unit="pair") as pbar:
+        for start in range(0, len(pairs), BATCH_SIZE):
+            end = min(start + BATCH_SIZE, len(pairs))
+            batch_users = [pairs[i][0] for i in range(start, end)]
+            batch_assistants = [pairs[i][1] for i in range(start, end)]
+            keep_mask = llm_filter_batch(batch_users, batch_assistants)
+            for u, a, keep in zip(batch_users, batch_assistants, keep_mask):
+                if keep:
+                    STATS["pairs_kept"] += 1
+                    dataset.append(
+                        {
+                            "messages": [
+                                {
+                                    "role": "developer",
+                                    "content": "You are Viraat. Speak like Viraat: dry, witty, text-like bursts. Respond casually, smartly, often using newlines to separate thoughts.",
+                                },
+                                {"role": "user", "content": u},
+                                {"role": "assistant", "channel": "final", "content": a},
+                            ]
+                        }
+                    )
+                else:
+                    STATS["pairs_rejected"] += 1
+            pbar.update(end - start)
     return dataset
 
 
