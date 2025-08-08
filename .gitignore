@@ -1,25 +1,25 @@
 # chat db
-process/chat.db
+data_prep/chat.db
 
 # Ignore model checkpoints and outputs
-inference/*/adapter_model.safetensors
-inference/*/adapter_config.json
-inference/*/training_args.bin
-inference/*/optimizer.pt
-inference/*/scheduler.pt
-inference/*/rng_state.pth
-inference/*/trainer_state.json
-inference/*/tokenizer.json
-inference/*/tokenizer_config.json
-inference/*/special_tokens_map.json
-inference/*/chat_template.jinja
-inference/*/README.md
+preprocess/inference/*/adapter_model.safetensors
+preprocess/inference/*/adapter_config.json
+preprocess/inference/*/training_args.bin
+preprocess/inference/*/optimizer.pt
+preprocess/inference/*/scheduler.pt
+preprocess/inference/*/rng_state.pth
+preprocess/inference/*/trainer_state.json
+preprocess/inference/*/tokenizer.json
+preprocess/inference/*/tokenizer_config.json
+preprocess/inference/*/special_tokens_map.json
+preprocess/inference/*/chat_template.jinja
+preprocess/inference/*/README.md
 
 # Ignore nested checkpoint directories
-inference/**/checkpoint-*/
+preprocess/inference/**/checkpoint-*/
 
 # Keep scripts
-!inference/chat_inference.py
+!preprocess/inference/chat_inference.py
 
 # Ignore dataset artifacts
 *.jsonl
