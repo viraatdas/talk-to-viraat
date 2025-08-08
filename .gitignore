@@ -1,3 +1,6 @@
+# chat db
+process/chat.db
+
 # Ignore model checkpoints and outputs
 inference/*/adapter_model.safetensors
 inference/*/adapter_config.json
